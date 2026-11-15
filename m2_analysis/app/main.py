@@ -1,7 +1,7 @@
 """Argos AI M2: local threat-intelligence analysis service.
 
 Reads public.raw_items and public.sources (M1/M4), writes only m2.*.
-Compatible with m2_initial_corrected.sql v1.1; prototype implementation.
+Compatible with m2_initial.sql v1.2; prototype implementation.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from psycopg.types.json import Jsonb
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 LOG = logging.getLogger("argos.m2")
 
-app = FastAPI(title="M2 KI-Analyse und Quellenbewertung", version="1.0.0")
+app = FastAPI(title="M2 KI-Analyse und Quellenbewertung", version="1.2.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://argos:argos@postgres:5432/argos")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
@@ -40,7 +40,7 @@ MAX_ARTICLE_CHARS = max(1000, int(os.getenv("M2_MAX_ARTICLE_CHARS", "12000")))
 CLUSTER_THRESHOLD = float(os.getenv("M2_CLUSTER_THRESHOLD", "0.82"))
 EVENT_THRESHOLD = float(os.getenv("M2_EVENT_THRESHOLD", "0.84"))
 RUN_MUTEX = threading.Lock()
-CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
+CVE_RE = re.compile(r"\bCVE-[0-9]{4}-[0-9]{4,}\b", re.IGNORECASE)
 CATEGORIES = {"VULNERABILITY", "ATTACK", "OUTAGE", "REGULATION", "GEOPOLITICS", "OTHER"}
 ENTITY_TYPES = {"VENDOR", "PRODUCT", "VERSION", "CVE", "THREAT_ACTOR"}
 CLAIM_TYPES = {"affected_versions", "active_exploitation", "patch_available"}
@@ -67,7 +67,8 @@ def text_hash(text: str) -> str:
 
 
 def vector_literal(values: list[float]) -> str:
-    if len(values) != EMBED_DIM or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+    if (len(values) != EMBED_DIM or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values)
+            or not any(values)):
         raise ValueError(f"Invalid embedding: expected {EMBED_DIM} finite numbers, got {len(values)}")
     return "[" + ",".join(format(float(v), ".9g") for v in values) + "]"
 
@@ -140,7 +141,7 @@ def cleaned_entities(model_entities: list[Any], title: str, body: str, known_cve
     for cve in sorted(validated_cves):
         result.append({"type": "CVE", "name": cve, "normalized_name": cve, "canonical_id": cve,
                        "evidence": cve, "confidence": 1.0, "method": "REGEX"})
-        seen.add(("CVE", cve))
+        seen.add(("CVE", cve.lower()))
     for item in model_entities[:8]:
         if not isinstance(item, dict):
             continue
@@ -152,7 +153,10 @@ def cleaned_entities(model_entities: list[Any], title: str, body: str, known_cve
             if name.upper() not in validated_cves:
                 continue  # do not store a hallucinated CVE
             name = name.upper()
-        key = (etype, name.casefold())
+        normalized = str(item.get("normalized_name") or name).strip()[:300] or name
+        if etype == "CVE":
+            normalized = name
+        key = (etype, normalized.lower())
         if key in seen:
             continue
         seen.add(key)
@@ -163,7 +167,7 @@ def cleaned_entities(model_entities: list[Any], title: str, body: str, known_cve
         except (TypeError, ValueError):
             confidence = 0.5
         result.append({"type": etype, "name": name,
-                       "normalized_name": str(item.get("normalized_name") or name).strip()[:300],
+                       "normalized_name": normalized,
                        "canonical_id": name if etype == "CVE" else None,
                        "evidence": evidence if evidence and evidence.casefold() in text.casefold() else None,
                        "confidence": confidence, "method": "LLM"})
@@ -206,7 +210,7 @@ def parse_date(value: Any) -> datetime | None:
 def load_unprocessed(conn: psycopg.Connection, limit: int) -> list[dict[str, Any]]:
     return conn.execute("""
         SELECT r.id, r.source_id, r.title, r.body, r.title_de, r.body_de,
-               r.cve_ids, r.published_at, r.fetched_at, r.translation_status,
+               r.cve_ids, r.published_at, r.fetched_at, r.translation_status, r.content_hash,
                s.source_type, s.is_primary_source, s.trust_weight
         FROM public.raw_items AS r
         JOIN public.sources AS s ON s.id = r.source_id
@@ -216,30 +220,27 @@ def load_unprocessed(conn: psycopg.Connection, limit: int) -> list[dict[str, Any
     """, (limit,)).fetchall()
 
 
+def article_input_type(item: dict[str, Any]) -> str:
+    return "TRANSLATED_TEXT" if item.get("translation_status") == "done" and item.get("body_de") is not None else "ORIGINAL_TEXT"
+
+
 def find_clusters(conn: psycopg.Connection, vec: str, item: dict[str, Any], limit: int = 4) -> list[dict[str, Any]]:
-    candidates = conn.execute("""
-        SELECT e.raw_item_id, cm.cluster_id, 1 - (e.embedding <=> %s::vector) AS similarity,
-               r.cve_ids
+    # Exact per-cluster ranking avoids duplicate vectors/news exhausting a global
+    # top-k before the other eligible cluster contexts have been considered.
+    cves = list(item.get("cve_ids") or [])
+    return conn.execute("""
+        SELECT cm.cluster_id, max(1 - (e.embedding <=> %s::vector)) AS similarity
         FROM m2.embeddings e
         JOIN m2.cluster_members cm ON cm.raw_item_id = e.raw_item_id
         JOIN public.raw_items r ON r.id = e.raw_item_id
         WHERE e.raw_item_id <> %s AND e.embedding_model = %s
-        ORDER BY e.embedding <=> %s::vector LIMIT 25
-    """, (vec, item["id"], EMBED_MODEL, vec)).fetchall()
-    result = []
-    seen = set()
-    current_cves = set(item.get("cve_ids") or [])
-    for row in candidates:
-        if float(row["similarity"]) < CLUSTER_THRESHOLD or row["cluster_id"] in seen:
-            continue
-        other_cves = set(row["cve_ids"] or [])
-        if current_cves and other_cves and current_cves.isdisjoint(other_cves):
-            continue
-        result.append(row)
-        seen.add(row["cluster_id"])
-        if len(result) >= limit:
-            break
-    return result
+          AND e.input_type IN ('ORIGINAL_TEXT','TRANSLATED_TEXT')
+          AND (cardinality(%s::text[]) = 0 OR cardinality(r.cve_ids) = 0
+               OR r.cve_ids && %s::text[])
+        GROUP BY cm.cluster_id
+        HAVING max(1 - (e.embedding <=> %s::vector)) >= %s
+        ORDER BY similarity DESC, cm.cluster_id LIMIT %s
+    """, (vec, item["id"], EMBED_MODEL, cves, cves, vec, CLUSTER_THRESHOLD, limit)).fetchall()
 
 
 def attach_clusters(conn: psycopg.Connection, item: dict[str, Any], vec: str, summary: str) -> list[str]:
@@ -249,8 +250,8 @@ def attach_clusters(conn: psycopg.Connection, item: dict[str, Any], vec: str, su
         cid = conn.execute("""
             INSERT INTO m2.clusters (cluster_name, description, representative_raw_item_id,
                                      clustering_method, algorithm_version)
-            VALUES (%s, %s, %s, 'cosine+bge-m3', 'm2-v1') RETURNING id
-        """, (item["title"][:250], summary[:1000], item["id"])).fetchone()["id"]
+            VALUES (%s, %s, %s, %s, 'm2-v1.2') RETURNING id
+        """, (item["title"][:250], summary[:1000], item["id"], 'cosine+' + EMBED_MODEL)).fetchone()["id"]
         matched = [{"cluster_id": cid, "similarity": 1.0}]
     for m in matched:
         conn.execute("""
@@ -258,6 +259,36 @@ def attach_clusters(conn: psycopg.Connection, item: dict[str, Any], vec: str, su
             VALUES (%s, %s, %s) ON CONFLICT (cluster_id, raw_item_id) DO NOTHING
         """, (m["cluster_id"], item["id"], min(1.0, max(0.0, float(m["similarity"])))) )
     return [str(m["cluster_id"]) for m in matched]
+
+
+def save_timeline_entry(conn: psycopg.Connection, event_id: Any, raw_item_id: int,
+                        occurred: datetime | None, desc: str) -> Any:
+    # Identical text at a different time is a different entry. Normalization is
+    # conservative (whitespace only), so a correction is not silently merged.
+    h = text_hash(" ".join(desc.split()))
+    existing = conn.execute("""
+        SELECT id, embedding_model FROM m2.event_timeline_entries
+        WHERE event_id=%s AND occurred_at IS NOT DISTINCT FROM %s::timestamptz AND content_hash=%s
+    """, (event_id, occurred, h)).fetchone()
+    if existing and existing["embedding_model"] == EMBED_MODEL:
+        entry_id = existing["id"]
+    else:
+        # One current vector per timeline entry. Event/news vectors are separately
+        # versioned by model. Include exact timestamp in the embedded narrative.
+        narrative = f"{occurred.isoformat() if occurred else 'unknown'}: {desc}"
+        entry_id = conn.execute("""
+            INSERT INTO m2.event_timeline_entries
+                (event_id, occurred_at, entry_text, embedding, embedding_model, content_hash)
+            VALUES (%s,%s,%s,%s::vector,%s,%s)
+            ON CONFLICT ON CONSTRAINT event_timeline_entry_unique DO UPDATE SET
+                embedding=EXCLUDED.embedding, embedding_model=EXCLUDED.embedding_model
+            RETURNING id
+        """, (event_id, occurred, desc, vector_literal(embed(narrative)), EMBED_MODEL, h)).fetchone()["id"]
+    conn.execute("""
+        INSERT INTO m2.event_timeline_sources (timeline_entry_id, raw_item_id)
+        VALUES (%s,%s) ON CONFLICT (timeline_entry_id, raw_item_id) DO NOTHING
+    """, (entry_id, raw_item_id))
+    return entry_id
 
 
 def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
@@ -268,8 +299,8 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
         SELECT ev.id, ev.metadata, 1 - (ee.embedding <=> %s::vector) AS similarity
         FROM m2.event_embeddings ee
         JOIN m2.events ev ON ev.id = ee.event_id
-        WHERE ee.embedding_model = %s
-        ORDER BY ee.embedding <=> %s::vector LIMIT 15
+        WHERE ee.embedding_model = %s AND ee.narrative_hash = ev.narrative_hash
+        ORDER BY (ee.embedding <=> %s::vector) + 0.0, ev.id LIMIT 15
     """, (vec, EMBED_MODEL, vec)).fetchall()
     selected = None
     for row in candidates:
@@ -291,7 +322,7 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
 
     # A publication date is evidence of a report date, NOT proof of the event's actual onset.
     entries: list[tuple[datetime | None, str]] = []
-    full_text = item["title"] + "\n" + (item["body_de"] or item["body"] or "")
+    full_text = (item["title_de"] or item["title"]) + "\n" + (item["body_de"] if item["body_de"] is not None else item["body"])
     for raw in timeline[:6]:
         if not isinstance(raw, dict):
             continue
@@ -308,17 +339,7 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
         occurred = item["published_at"] or item["fetched_at"]
         entries.append((occurred, "Veröffentlichung/Erfassung der Meldung: " + summary[:750]))
     for occurred, desc in entries:
-        h = text_hash(desc)
-        already = conn.execute("""
-            SELECT 1 FROM m2.event_timeline_entries WHERE event_id=%s AND content_hash=%s
-        """, (selected, h)).fetchone()
-        if not already:
-            timeline_vec = vector_literal(embed(desc))
-            conn.execute("""
-                INSERT INTO m2.event_timeline_entries
-                    (event_id, raw_item_id, occurred_at, entry_text, embedding, embedding_model, content_hash)
-                VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
-            """, (selected, item["id"], occurred, desc, timeline_vec, EMBED_MODEL, h))
+        save_timeline_entry(conn, selected, item["id"], occurred, desc)
     if entries and any(not d.startswith("Veröffentlichung/Erfassung") for _, d in entries):
         grounded_dates = [dt for dt, desc in entries if not desc.startswith("Veröffentlichung/Erfassung") and dt]
         if grounded_dates:
@@ -330,7 +351,7 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
             """, (min(grounded_dates), min(grounded_dates), selected))
     rows = conn.execute("""
         SELECT occurred_at, entry_text FROM m2.event_timeline_entries
-        WHERE event_id = %s ORDER BY occurred_at DESC NULLS LAST LIMIT 20
+        WHERE event_id = %s ORDER BY occurred_at DESC NULLS LAST, id LIMIT 20
     """, (selected,)).fetchall()
     chronology = "\n".join(f"{r['occurred_at'].isoformat() if r['occurred_at'] else 'unknown'}: {r['entry_text']}" for r in reversed(rows))
     conn.execute("""
@@ -342,10 +363,11 @@ def attach_event(conn: psycopg.Connection, item: dict[str, Any], vec: str,
     conn.execute("""
         INSERT INTO m2.event_embeddings (event_id, embedding, embedding_model, narrative_hash)
         VALUES (%s, %s::vector, %s, %s)
-        ON CONFLICT (event_id) DO UPDATE SET embedding=EXCLUDED.embedding,
+        ON CONFLICT (event_id, embedding_model) DO UPDATE SET embedding=EXCLUDED.embedding,
             embedding_model=EXCLUDED.embedding_model, narrative_hash=EXCLUDED.narrative_hash,
             embedded_at=now()
     """, (selected, vector_literal(embed(narrative)), EMBED_MODEL, text_hash(narrative)))
+    conn.execute("UPDATE m2.events SET narrative_hash=%s WHERE id=%s", (text_hash(narrative), selected))
     for cid in clusters_ids:
         conn.execute("""
             UPDATE m2.clusters SET primary_event_id=COALESCE(primary_event_id, %s), updated_at=now()
@@ -370,7 +392,7 @@ def link_related_events(conn: psycopg.Connection, event_id: Any, item: dict[str,
             AND ne.entity_type=oe.entity_type
             AND ne.entity_type IN ('VENDOR','PRODUCT')
             AND ne.normalized_name=oe.normalized_name
-        WHERE ev.id<>%s AND ee.embedding_model=%s
+        WHERE ev.id<>%s AND ee.embedding_model=%s AND ee.narrative_hash=ev.narrative_hash
         ORDER BY ev.id, similarity DESC LIMIT 20
     """, (vec, item["id"], event_id, EMBED_MODEL)).fetchall()
     current_date_row = conn.execute("SELECT occurred_start_at FROM m2.events WHERE id=%s", (event_id,)).fetchone()
@@ -395,55 +417,92 @@ def link_related_events(conn: psycopg.Connection, event_id: Any, item: dict[str,
               note, Jsonb([{"raw_item_id": item["id"]}, {"raw_item_id": peer["evidence_item"]}])))
 
 
+def claim_value_text(value: Any) -> str:
+    # Keep claim_1/claim_2 readable; serialize structured values deterministically.
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return str(value)
+
+
+def canonical_comparison(first_id: int, second_id: int, first_claim: str,
+                         second_claim: str, first_evidence: str | None = None,
+                         second_evidence: str | None = None) -> tuple[int, int, str, str, str | None, str | None]:
+    if first_id == second_id:
+        raise ValueError("Cannot compare a report with itself")
+    if first_id > second_id:
+        return second_id, first_id, second_claim, first_claim, second_evidence, first_evidence
+    return first_id, second_id, first_claim, second_claim, first_evidence, second_evidence
+
+
 def find_relations_and_score(conn: psycopg.Connection, item: dict[str, Any], clusters_ids: list[str],
                              claims: list[dict[str, Any]]) -> tuple[float, bool, list[dict[str, Any]]]:
-    """Compare grounded claims. Time-varying patch/exploitation claims are not automatically contradictions."""
-    other = conn.execute("""
-        SELECT DISTINCT ON (r.id) r.id, r.source_id, r.published_at, s.key_claims, cm.cluster_id
-        FROM m2.cluster_members cm
-        JOIN public.raw_items r ON r.id=cm.raw_item_id
-        JOIN m2.summaries s ON s.raw_item_id=r.id
-        WHERE cm.cluster_id=ANY(%s::uuid[]) AND r.id <> %s
-        ORDER BY r.id, cm.cluster_id LIMIT 30
-    """, (clusters_ids, item["id"])).fetchall()
-    other_sources = {r["source_id"] for r in other if r["source_id"] != item["source_id"]}
-    independent_score = min(1.0, len(other_sources) / 2)
+    """Keep each cluster context; do not count the same source twice across clusters."""
+    confirmed_sources = set()
     contradiction = False
     relationships: list[dict[str, Any]] = []
-    for old in other:
-        for current_claim in claims:
-            for old_claim in old["key_claims"] if isinstance(old["key_claims"], list) else []:
-                if not isinstance(old_claim, dict) or old_claim.get("claim_type") != current_claim["claim_type"]:
-                    continue
-                a, b = current_claim.get("value"), old_claim.get("value")
-                if a is None or b is None:
-                    continue
-                if a == b:
-                    kind = "CONFIRMATION"
-                elif current_claim["claim_type"] in {"patch_available", "active_exploitation"}:
-                    # Status may evolve. Do not claim a contradiction on different publication dates.
-                    if item["published_at"] and old["published_at"] and item["published_at"].date() != old["published_at"].date():
-                        kind = "ADDITION"
+    seen = set()
+    # Limit peers per cluster, not across all clusters. No DISTINCT ON (r.id)
+    # across clusters: it would drop legitimate comparison contexts.
+    for cid in dict.fromkeys(clusters_ids):
+        other = conn.execute("""
+            SELECT r.id, r.source_id, r.published_at, r.content_hash, s.key_claims
+            FROM m2.cluster_members cm
+            JOIN public.raw_items r ON r.id=cm.raw_item_id
+            JOIN m2.summaries s ON s.raw_item_id=r.id
+            WHERE cm.cluster_id=%s AND r.id<>%s
+            ORDER BY r.id LIMIT 30
+        """, (cid, item["id"])).fetchall()
+        for old in other:
+            for current_claim in claims:
+                for old_claim in old["key_claims"] if isinstance(old["key_claims"], list) else []:
+                    if not isinstance(old_claim, dict) or old_claim.get("claim_type") != current_claim["claim_type"]:
+                        continue
+                    a, b = current_claim.get("value"), old_claim.get("value")
+                    if a is None or b is None:
+                        continue
+                    if a == b:
+                        kind = "CONFIRMATION"
+                    elif current_claim["claim_type"] in {"patch_available", "active_exploitation"}:
+                        # Without two known, matching publication days, treat differing status
+                        # as a possible update, not a proven contradiction.
+                        if (not item["published_at"] or not old["published_at"] or
+                                item["published_at"].date() != old["published_at"].date()):
+                            kind = "ADDITION"
+                        else:
+                            kind = "CONTRADICTION"
                     else:
                         kind = "CONTRADICTION"
+                    first, second, c1, c2, ev1, ev2 = canonical_comparison(
+                        old["id"], item["id"], claim_value_text(b), claim_value_text(a),
+                        old_claim.get("evidence"), current_claim.get("evidence"))
+                    key = (str(cid), first, second, current_claim["claim_type"], c1, c2, ev1, ev2)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if kind == "CONTRADICTION":
                         contradiction = True
-                else:
-                    kind = "CONTRADICTION"
-                    contradiction = True
-                relationships.append({"old_id": old["id"], "cluster_id": old["cluster_id"], "relation_type": kind,
-                                      "claim_type": current_claim["claim_type"],
-                                      "claim_1": str(old_claim["value"]), "claim_2": str(a),
-                                      "reasoning": "Regelbasierter Vergleich der bezeugten Kernaussagen; Zeitbezug beachten."})
-    # Avoid exploding rows in a large cluster.
-    for rel in relationships[:30]:
-        conn.execute("""
-            INSERT INTO m2.contradictions
-                (cluster_id, raw_item_id_1, raw_item_id_2, relation_type, claim_type,
-                 claim_1, claim_2, reasoning, confidence, model_name)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (rel["cluster_id"], rel["old_id"], item["id"], rel["relation_type"],
-              rel["claim_type"], rel["claim_1"], rel["claim_2"], rel["reasoning"], 0.7, "rules-v1"))
-    return independent_score, contradiction, relationships[:30]
+                    elif (kind == "CONFIRMATION" and old["source_id"] != item["source_id"]
+                          and old["content_hash"] != item.get("content_hash")):
+                        confirmed_sources.add(old["source_id"])
+                    rel = {"old_id": old["id"], "cluster_id": cid, "relation_type": kind,
+                           "claim_type": current_claim["claim_type"], "claim_1": c1, "claim_2": c2,
+                           "raw_item_id_1": first, "raw_item_id_2": second,
+                           "claim_evidence_1": ev1, "claim_evidence_2": ev2,
+                           "reasoning": "Regelbasierter Vergleich; möglicher gemeinsamer Sachverhalt, Zeitbezug und Belege prüfen."}
+                    relationships.append(rel)
+                    conn.execute("""
+                        INSERT INTO m2.contradictions
+                            (cluster_id, raw_item_id_1, raw_item_id_2, relation_type, claim_type,
+                             claim_1, claim_2, claim_evidence_1, claim_evidence_2,
+                             reasoning, confidence, model_name)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT ON CONSTRAINT contradictions_identity DO UPDATE SET
+                            relation_type=EXCLUDED.relation_type, reasoning=EXCLUDED.reasoning,
+                            confidence=EXCLUDED.confidence, model_name=EXCLUDED.model_name,
+                            analyzed_at=now()
+                    """, (cid, first, second, kind, rel["claim_type"], c1, c2, ev1, ev2,
+                          rel["reasoning"], 0.7, "rules-v1.2"))
+    return min(1.0, len(confirmed_sources) / 2), contradiction, relationships
 
 
 def save_trust(conn: psycopg.Connection, item: dict[str, Any], corroboration: float,
@@ -470,7 +529,7 @@ def save_trust(conn: psycopg.Connection, item: dict[str, Any], corroboration: fl
            (raw_item_id, trust_score, trust_label, source_type_score, corroboration_score,
             primary_source_score, recency_score, contradiction_score,
             score_breakdown, reasoning, scoring_version)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'rules-v1')
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'rules-v1.2')
         ON CONFLICT (raw_item_id) DO UPDATE SET
             trust_score=EXCLUDED.trust_score, trust_label=EXCLUDED.trust_label,
             source_type_score=EXCLUDED.source_type_score,
@@ -506,21 +565,34 @@ def process_item(conn: psycopg.Connection, item: dict[str, Any]) -> dict[str, An
               (raw_item_id, entity_type, name, normalized_name, canonical_id,
                confidence, extraction_method, evidence_text, attributes)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (raw_item_id, entity_type, lower(btrim(coalesce(normalized_name, name))))
+            DO NOTHING
         """, (item["id"], ent["type"], ent["name"], ent["normalized_name"], ent["canonical_id"],
               ent["confidence"], ent["method"], ent["evidence"], Jsonb({})))
     base_text = full_text[:MAX_ARTICLE_CHARS]
     full_vec = vector_literal(embed(base_text))
-    input_type = "TRANSLATED_TEXT" if item["body_de"] is not None else "ORIGINAL_TEXT"
+    input_type = article_input_type(item)
     conn.execute("""
         INSERT INTO m2.embeddings (raw_item_id, embedding, embedding_model, input_type, input_hash)
         VALUES (%s,%s::vector,%s,%s,%s)
+        ON CONFLICT ON CONSTRAINT embeddings_identity DO UPDATE SET
+            embedding=EXCLUDED.embedding, input_hash=EXCLUDED.input_hash, embedded_at=now()
     """, (item["id"], full_vec, EMBED_MODEL, input_type, text_hash(base_text)))
+    summary_vec = vector_literal(embed(parsed["summary"]))
+    conn.execute("""
+        INSERT INTO m2.embeddings (raw_item_id, embedding, embedding_model, input_type, input_hash)
+        VALUES (%s,%s::vector,%s,'SUMMARY',%s)
+        ON CONFLICT ON CONSTRAINT embeddings_identity DO UPDATE SET
+            embedding=EXCLUDED.embedding, input_hash=EXCLUDED.input_hash, embedded_at=now()
+    """, (item["id"], summary_vec, EMBED_MODEL, text_hash(parsed["summary"])))
     for i, chunk in enumerate(chunks(full_text)):
         conn.execute("""
             INSERT INTO m2.text_chunks
-              (raw_item_id, chunk_index, chunk_text, embedding, embedding_model, source_hash)
-            VALUES (%s,%s,%s,%s::vector,%s,%s)
-        """, (item["id"], i, chunk, vector_literal(embed(chunk)), EMBED_MODEL, text_hash(full_text)))
+              (raw_item_id, chunk_index, chunk_text, embedding, embedding_model, source_hash, input_type)
+            VALUES (%s,%s,%s,%s::vector,%s,%s,%s)
+            ON CONFLICT ON CONSTRAINT text_chunks_item_index_unique DO UPDATE SET
+                chunk_text=EXCLUDED.chunk_text, embedding=EXCLUDED.embedding, source_hash=EXCLUDED.source_hash
+        """, (item["id"], i, chunk, vector_literal(embed(chunk)), EMBED_MODEL, text_hash(full_text), input_type))
     clusters_ids = attach_clusters(conn, item, full_vec, parsed["summary"])
     event_id = attach_event(conn, item, full_vec, parsed["summary"], parsed["category"], parsed["timeline"], clusters_ids)
     corroboration, contradiction, _ = find_relations_and_score(conn, item, clusters_ids, claims)
@@ -552,8 +624,9 @@ def run() -> dict[str, Any]:
                 conn.commit()
                 for item in candidates:
                     try:
-                        completed.append(process_item(conn, item))
+                        result = process_item(conn, item)
                         conn.commit()  # commit all m2.* rows together, only after success
+                        completed.append(result)
                     except Exception as exc:
                         conn.rollback()  # retry next /run; no partial results
                         LOG.exception("M2 failed for raw_item_id=%s", item["id"])
@@ -583,18 +656,21 @@ def history_search(request: HistoryQuery) -> dict[str, Any]:
                    1-(ee.embedding <=> %s::vector) AS similarity
             FROM m2.event_embeddings ee
             JOIN m2.events e ON e.id = ee.event_id
-            WHERE ee.embedding_model = %s
+            WHERE ee.embedding_model = %s AND ee.narrative_hash = e.narrative_hash
               AND (%s::timestamptz IS NULL OR e.occurred_start_at <= %s::timestamptz)
               AND (%s::timestamptz IS NULL OR e.occurred_start_at >= %s::timestamptz)
-            ORDER BY ee.embedding <=> %s::vector LIMIT %s
+            ORDER BY (ee.embedding <=> %s::vector) + 0.0, e.id LIMIT %s
         """, (query_vec, EMBED_MODEL, request.before, request.before,
               request.after, request.after, query_vec, request.limit)).fetchall()
         results = []
         for e in rows:
             events = conn.execute("""
-                SELECT occurred_at, entry_text, raw_item_id
-                FROM m2.event_timeline_entries WHERE event_id=%s
-                ORDER BY occurred_at NULLS LAST LIMIT 40
+                SELECT t.id, t.occurred_at, t.entry_text,
+                       COALESCE((SELECT array_agg(ts.raw_item_id ORDER BY ts.raw_item_id)
+                                 FROM m2.event_timeline_sources ts WHERE ts.timeline_entry_id=t.id),
+                                ARRAY[]::bigint[]) AS raw_item_ids
+                FROM m2.event_timeline_entries t WHERE t.event_id=%s
+                ORDER BY t.occurred_at NULLS LAST, t.id LIMIT 40
             """, (e["id"],)).fetchall()
             relatives = conn.execute("""
                 SELECT from_event_id, to_event_id, relation_type, explanation
